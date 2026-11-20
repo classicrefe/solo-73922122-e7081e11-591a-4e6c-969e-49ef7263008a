@@ -18,7 +18,7 @@ import uuid
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
-from .models import ActiveInput
+from .models import ActiveInput, CaseLock, StaleCaseTableError
 
 
 def _now() -> str:
@@ -63,10 +63,27 @@ class Database:
                     result_json TEXT NOT NULL,
                     created_at TEXT NOT NULL,
                     invalidated INTEGER NOT NULL DEFAULT 0,
-                    invalidated_at TEXT
+                    invalidated_at TEXT,
+                    case_table_epoch INTEGER NOT NULL DEFAULT 0,
+                    case_table_id TEXT NOT NULL DEFAULT ''
                 );
                 """
             )
+            # 旧库迁移：为已发布清单补充“病例表身份”列
+            cols = {
+                r["name"]
+                for r in self._conn.execute(
+                    "PRAGMA table_info(published_manifests)"
+                ).fetchall()
+            }
+            for col, decl in (
+                ("case_table_epoch", "INTEGER NOT NULL DEFAULT 0"),
+                ("case_table_id", "TEXT NOT NULL DEFAULT ''"),
+            ):
+                if col not in cols:
+                    self._conn.execute(
+                        f"ALTER TABLE published_manifests ADD COLUMN {col} {decl}"
+                    )
             row = self._conn.execute("SELECT COUNT(*) AS n FROM state").fetchone()
             if row["n"] == 0:
                 empty = ActiveInput().to_json()
@@ -101,7 +118,8 @@ class Database:
         with self._lock:
             rows = self._conn.execute(
                 "SELECT manifest_id, dataset_version, created_at, invalidated,"
-                " invalidated_at, result_json FROM published_manifests"
+                " invalidated_at, result_json, case_table_epoch, case_table_id"
+                " FROM published_manifests"
                 " ORDER BY created_at DESC, manifest_id DESC"
             ).fetchall()
         out = []
@@ -117,6 +135,8 @@ class Database:
                     "invalidated": bool(r["invalidated"]),
                     "invalidated_at": r["invalidated_at"],
                     "expired": expired,
+                    "case_table_epoch": r["case_table_epoch"],
+                    "case_table_id": r["case_table_id"],
                     "case_count": result.get("stats", {}).get("case_count"),
                     "counts": result.get("stats", {}).get("counts"),
                 }
@@ -143,45 +163,180 @@ class Database:
             "invalidated": bool(row["invalidated"]),
             "invalidated_at": row["invalidated_at"],
             "expired": expired,
+            "case_table_epoch": row["case_table_epoch"],
+            "case_table_id": row["case_table_id"],
         }
 
     # ------------------------------------------------------------------ #
     # 写（每个方法一个 IMMEDIATE 事务；异常回滚，源数据不变）
     # ------------------------------------------------------------------ #
+    def _begin(self):
+        self._conn.execute("BEGIN IMMEDIATE")
+
+    def _write_state(
+        self,
+        new_input: ActiveInput,
+        new_version: int,
+        change_type: str,
+        detail: Dict[str, Any],
+    ) -> None:
+        """在已开启的事务内写入新状态、失效旧清单并记录版本日志。"""
+        self._conn.execute(
+            "UPDATE state SET dataset_version = ?, input_json = ?, updated_at = ?"
+            " WHERE id = 1",
+            (
+                new_version,
+                json.dumps(new_input.to_json(), ensure_ascii=False),
+                _now(),
+            ),
+        )
+        # 所有此前发布的清单随输入变动永久失效
+        self._conn.execute(
+            "UPDATE published_manifests SET invalidated = 1, invalidated_at = ?"
+            " WHERE invalidated = 0",
+            (_now(),),
+        )
+        self._conn.execute(
+            "INSERT INTO version_log (dataset_version, change_type, detail,"
+            " created_at) VALUES (?, ?, ?, ?)",
+            (
+                new_version,
+                change_type,
+                json.dumps(detail, ensure_ascii=False),
+                _now(),
+            ),
+        )
+
     def _commit_new_input(
-        self, new_input: ActiveInput, change_type: str, detail: Dict[str, Any]
+        self,
+        build_input,
+        change_type: str,
+        build_detail,
     ) -> int:
+        """在同一 IMMEDIATE 事务内“读取当前输入 → 构造新输入 → 写入”。
+
+        读取与写入不可分开：否则并发保存锁定/上传病例时，后写者会基于旧快照
+        覆盖前者的改动（丢失更新）。回调在事务内执行，抛异常则整体回滚。
+        """
         with self._lock:
             try:
-                self._conn.execute("BEGIN IMMEDIATE")
+                self._begin()
                 row = self._conn.execute(
-                    "SELECT dataset_version FROM state WHERE id = 1"
+                    "SELECT dataset_version, input_json FROM state WHERE id = 1"
                 ).fetchone()
+                current = ActiveInput.from_json(json.loads(row["input_json"]))
+                new_input = build_input(current)
+                self._write_state(
+                    new_input, row["dataset_version"] + 1,
+                    change_type, build_detail(current, new_input),
+                )
+                self._conn.commit()
+                return row["dataset_version"] + 1
+            except Exception:
+                self._conn.rollback()
+                raise
+
+    def replace_cases(self, cases) -> int:
+        """整体替换病例表。
+
+        锁定只在“病例号与患者号都相同”时才保留；病例号改指另一位患者时，
+        旧患者的锁定绝不跟随病例号迁移到新患者。
+        """
+        def build(current: ActiveInput) -> ActiveInput:
+            new_patients = {c.case_id: c.patient_id for c in cases}
+            kept_locks: Dict[str, CaseLock] = {
+                cid: lock for cid, lock in current.locks.items()
+                if new_patients.get(cid) == lock.patient_id
+            }
+            return ActiveInput(
+                cases=list(cases),
+                relatives=[],  # 病例整体替换后，旧亲属对可能引用已删除患者，须清空重传
+                quotas=current.quotas,
+                locks=kept_locks,
+                case_table_epoch=current.case_table_epoch + 1,
+            )
+
+        def detail(current: ActiveInput, new_input: ActiveInput) -> Dict[str, Any]:
+            return {
+                "case_count": len(cases),
+                "relatives_cleared": True,
+                "case_table_epoch": new_input.case_table_epoch,
+                "locks_dropped": sorted(set(current.locks) - set(new_input.locks)),
+            }
+
+        return self._commit_new_input(build, "upload_cases", detail)
+
+    def replace_relatives(self, relatives) -> int:
+        def build(current: ActiveInput) -> ActiveInput:
+            return ActiveInput(
+                cases=current.cases,
+                relatives=list(relatives),
+                quotas=current.quotas,
+                locks=current.locks,
+                case_table_epoch=current.case_table_epoch,
+            )
+
+        return self._commit_new_input(
+            build, "upload_relatives",
+            lambda _c, _n: {"pair_count": len(relatives)},
+        )
+
+    def update_quotas(self, quotas: Dict[Tuple[int, int], int]) -> int:
+        def build(current: ActiveInput) -> ActiveInput:
+            return ActiveInput(
+                cases=current.cases,
+                relatives=current.relatives,
+                quotas=dict(quotas),
+                locks=current.locks,
+                case_table_epoch=current.case_table_epoch,
+            )
+
+        return self._commit_new_input(
+            build, "update_quotas",
+            lambda _c, _n: {f"g{g}_label{l}": quotas[(g, l)]
+                            for g in (1, 2) for l in (0, 1)},
+        )
+
+    def update_locks(self, locks: Dict[str, CaseLock], case_table_id: str) -> int:
+        """保存完整锁定表，并在同一事务内核对“操作所依据的病例表”。
+
+        只核对病例表内容指纹，不核对版本号：单独修改配额（或亲属关系）虽然会
+        让输入版本 +1，但同一病例表上的锁定提交依然有效，不会过期。
+        病例表一旦被替换（指纹不同），整次提交拒绝且不落库、不递增版本，
+        现行锁定、输入版本与已发布清单保持原样。
+        """
+        with self._lock:
+            try:
+                self._begin()
+                row = self._conn.execute(
+                    "SELECT dataset_version, input_json FROM state WHERE id = 1"
+                ).fetchone()
+                current = ActiveInput.from_json(json.loads(row["input_json"]))
+                current_table_id = current.case_table_id()
+                if case_table_id != current_table_id:
+                    raise StaleCaseTableError(
+                        "锁定提交所依据的病例表已被替换"
+                        f"（提交依据 {case_table_id[:8] or '未知'}…，"
+                        f"当前病例表 {current_table_id[:8]}…）。"
+                        "整次提交已拒绝，现行锁定、输入版本与已发布清单均未改动；"
+                        "请刷新页面、重新核对新病例表后再保存锁定。"
+                    )
+                new_input = ActiveInput(
+                    cases=current.cases,
+                    relatives=current.relatives,
+                    quotas=current.quotas,
+                    locks=dict(locks),
+                    case_table_epoch=current.case_table_epoch,
+                )
                 new_version = row["dataset_version"] + 1
-                self._conn.execute(
-                    "UPDATE state SET dataset_version = ?, input_json = ?, updated_at = ?"
-                    " WHERE id = 1",
-                    (
-                        new_version,
-                        json.dumps(new_input.to_json(), ensure_ascii=False),
-                        _now(),
-                    ),
-                )
-                # 所有此前发布的清单随输入变动永久失效
-                self._conn.execute(
-                    "UPDATE published_manifests SET invalidated = 1, invalidated_at = ?"
-                    " WHERE invalidated = 0",
-                    (_now(),),
-                )
-                self._conn.execute(
-                    "INSERT INTO version_log (dataset_version, change_type, detail,"
-                    " created_at) VALUES (?, ?, ?, ?)",
-                    (
-                        new_version,
-                        change_type,
-                        json.dumps(detail, ensure_ascii=False),
-                        _now(),
-                    ),
+                self._write_state(
+                    new_input, new_version, "update_locks",
+                    {
+                        "lock_count": len(locks),
+                        "case_table_id": current_table_id,
+                        "locks": {cid: lock.group
+                                  for cid, lock in sorted(locks.items())},
+                    },
                 )
                 self._conn.commit()
                 return new_version
@@ -189,63 +344,13 @@ class Database:
                 self._conn.rollback()
                 raise
 
-    def replace_cases(self, cases) -> int:
-        _, current = self.get_state()
-        new_input = ActiveInput(
-            cases=list(cases),
-            relatives=[],  # 病例整体替换后，旧亲属对可能引用已删除患者，须清空重传
-            quotas=current.quotas,
-            locks={cid: g for cid, g in current.locks.items() if cid in {c.case_id for c in cases}},
-        )
-        return self._commit_new_input(
-            new_input,
-            "upload_cases",
-            {"case_count": len(cases), "relatives_cleared": True,
-             "locks_dropped": sorted(set(current.locks) - set(new_input.locks))},
-        )
-
-    def replace_relatives(self, relatives) -> int:
-        _, current = self.get_state()
-        new_input = ActiveInput(
-            cases=current.cases,
-            relatives=list(relatives),
-            quotas=current.quotas,
-            locks=current.locks,
-        )
-        return self._commit_new_input(
-            new_input, "upload_relatives", {"pair_count": len(relatives)}
-        )
-
-    def update_quotas(self, quotas: Dict[Tuple[int, int], int]) -> int:
-        _, current = self.get_state()
-        new_input = ActiveInput(
-            cases=current.cases,
-            relatives=current.relatives,
-            quotas=dict(quotas),
-            locks=current.locks,
-        )
-        return self._commit_new_input(
-            new_input,
-            "update_quotas",
-            {f"g{g}_label{l}": quotas[(g, l)] for g in (1, 2) for l in (0, 1)},
-        )
-
-    def update_locks(self, locks: Dict[str, int]) -> int:
-        _, current = self.get_state()
-        new_input = ActiveInput(
-            cases=current.cases,
-            relatives=current.relatives,
-            quotas=current.quotas,
-            locks=dict(locks),
-        )
-        return self._commit_new_input(
-            new_input, "update_locks", {"lock_count": len(locks), "locks": dict(sorted(locks.items()))}
-        )
-
     def publish_manifest(
         self, expected_version: int, input_data: dict, result: dict
     ) -> Dict[str, Any]:
         manifest_id = uuid.uuid4().hex
+        # 清单记录其依据的病例表身份，便于审计“用的是哪一份病例表”
+        basis = ActiveInput.from_json(input_data)
+        table_id = basis.case_table_id()
         with self._lock:
             try:
                 self._conn.execute("BEGIN IMMEDIATE")
@@ -258,17 +363,25 @@ class Database:
                         f"输入已从版本 {expected_version} 变动到"
                         f" {row['dataset_version']}，该预览已永久失效，不能发布。"
                     )
+                # 版本相同即输入完全相同；仍显式核对病例表身份，防止未来语义调整
+                if ActiveInput.from_json(json.loads(row["input_json"])).case_table_id() != table_id:
+                    raise StaleVersionError(
+                        "预览依据的病例表与当前病例表不一致，不能发布，请重新求解。"
+                    )
                 now = _now()
                 self._conn.execute(
                     "INSERT INTO published_manifests (manifest_id, dataset_version,"
-                    " input_json, result_json, created_at, invalidated)"
-                    " VALUES (?, ?, ?, ?, ?, 0)",
+                    " input_json, result_json, created_at, invalidated,"
+                    " case_table_epoch, case_table_id)"
+                    " VALUES (?, ?, ?, ?, ?, 0, ?, ?)",
                     (
                         manifest_id,
                         expected_version,
                         json.dumps(input_data, ensure_ascii=False),
                         json.dumps(result, ensure_ascii=False),
                         now,
+                        basis.case_table_epoch,
+                        table_id,
                     ),
                 )
                 self._conn.commit()

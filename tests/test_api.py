@@ -177,7 +177,9 @@ def test_reupload_cases_clears_relatives_and_stale_locks(client):
     client.put("/api/locks", json={"locks": [{"case_id": "C1", "group": 1}]})
     state = client.get("/api/state").json()
     assert len(state["input"]["relatives"]) == 2
-    assert state["input"]["locks"] == {"C1": 1}
+    assert state["input"]["locks"] == [
+        {"case_id": "C1", "patient_id": "P1", "group": 1}
+    ]
 
     # 重新上传（病例号集合变化）
     new_csv = CASES_CSV.replace("C1,P1,1", "C1,P1,1").replace("C8,P4,0", "C9,P9,0\n")

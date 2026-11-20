@@ -11,6 +11,7 @@
   <h1>影像训练数据 · 病例切分平台</h1>
   <div class="meta">
     <span>当前输入版本：<b id="currentVersion">–</b></span>
+    <span>病例表：<b id="currentTable">–</b></span>
     <span id="healthBadge" class="badge">连接中…</span>
   </div>
 </header>
@@ -88,7 +89,8 @@
 
   <h2>病例锁定（可选）</h2>
   <p class="hint">把指定病例强制分入某一组；与该病例通过同患者/亲属关系连通的所有病例也会同组。
-    每次保存提交完整锁定表。</p>
+    每条锁定绑定<b>病例号 + 患者号</b>：换病例表时，只有病例号与患者号都相同的锁定才保留，
+    病例号改指其他患者时旧锁定不会跟随迁移。每次保存提交完整锁定表，并核对所依据的病例表。</p>
   <div class="row">
     <input type="text" id="lockFilter" placeholder="按病例号/患者号筛选…" oninput="renderLocks()">
     <button onclick="saveLocks()">保存锁定（输入版本 +1）</button>
@@ -178,6 +180,7 @@
   </div>
 </section>
 
+<script src="/lock_state.js"></script>
 <script src="/app.js"></script>
 </body>
 </html>

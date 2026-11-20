@@ -8,7 +8,12 @@ const escapeHtml = (s) =>
 
 let currentVersion = null;
 let currentState = null;
-let lastPreview = null; // {token, version, result, input}
+let currentTableId = null;   // 当前病例表内容指纹
+let lastPreview = null; // {token, version, result, input, caseTableId}
+
+// 用户尚未保存的锁定选择与其所属病例表；换表后必须整体丢弃，
+// 绝不能把原患者的选择带去同号新患者那一行。
+let lockDraft = null; // {caseTableId, choices: {case_id: "1"|"2"|""}}
 
 // --------------------------------------------------------------------------- //
 // 基础请求
@@ -76,6 +81,11 @@ async function uploadCases() {
   setMsg("casesMsg", "上传中…");
   try {
     const r = await api("/api/upload/cases", { method: "POST", body: fd });
+    // 换表即刻丢弃本地锁定草稿与旧预览，不给“旧患者选择流入新患者行”留窗口
+    lockDraft = null;
+    lastPreview = null;
+    $("satBox").classList.add("hidden");
+    $("unsatBox").classList.add("hidden");
     setMsg("casesMsg", `已上传 ${r.case_count} 个病例，新版本 v${r.dataset_version}。${r.notice}`, true);
     $("casesFile").value = "";
     await refreshAll();
@@ -103,7 +113,10 @@ function renderState() {
   const version = currentState.dataset_version;
   const input = currentState.input;
   currentVersion = version;
+  currentTableId = currentState.case_table_id;
   $("currentVersion").textContent = "v" + version;
+  $("currentTable").textContent =
+    `代次 ${currentState.case_table_epoch} · ${String(currentTableId).slice(0, 8)}…`;
 
   const totals = currentState.label_totals;
   $("totL0").textContent = totals[0];
@@ -115,7 +128,8 @@ function renderState() {
     ["病例数", input.cases.length],
     ["患者数", currentState.patient_count],
     ["亲属对数", input.relatives.length],
-    ["锁定数", Object.keys(input.locks).length],
+    ["锁定数", (input.locks || []).length],
+    ["病例表代次", currentState.case_table_epoch],
   ].map(([k, v]) => `<div class="card"><b>${v}</b><span>${k}</span></div>`).join("");
 
   $("caseCount").textContent = input.cases.length;
@@ -166,25 +180,27 @@ async function saveQuotas() {
 function renderLocks() {
   if (!currentState) return;
   const input = currentState.input;
-  // 轮询重建前保留用户尚未保存的选择，避免被 4 秒刷新冲掉
-  const prior = {};
-  document.querySelectorAll("[data-lock-case]").forEach((sel) => {
-    prior[sel.dataset.lockCase] = sel.value;
-  });
+  const tableId = currentState.case_table_id;
+
+  // 草稿只记录用户实际改动过的行；换表后整体作废。
+  lockDraft = LockState.syncDraft(lockDraft, tableId);
+  const values = LockState.rowValues(tableId, lockDraft, input.cases, input.locks);
+
   const filter = $("lockFilter").value.trim().toLowerCase();
-  const rows = input.cases
-    .filter((c) => !filter || c.case_id.toLowerCase().includes(filter) ||
-      c.patient_id.toLowerCase().includes(filter))
+  const visibleCases = input.cases.filter(
+    (c) => !filter || c.case_id.toLowerCase().includes(filter) ||
+      c.patient_id.toLowerCase().includes(filter));
+  const rows = visibleCases
     .map((c) => {
-      const saved = input.locks[c.case_id];
-      const effective = Object.prototype.hasOwnProperty.call(prior, c.case_id)
-        ? prior[c.case_id]
-        : (saved === undefined ? "" : String(saved));
+      const effective = values[c.case_id] ?? "";
       return `<tr>
         <td>${escapeHtml(c.case_id)}</td>
         <td>${escapeHtml(c.patient_id)}</td>
         <td>${c.label}</td>
-        <td><select data-lock-case="${escapeHtml(c.case_id)}">
+        <td><select data-lock-case="${escapeHtml(c.case_id)}"
+                    data-lock-patient="${escapeHtml(c.patient_id)}"
+                    data-lock-table="${escapeHtml(tableId)}"
+                    onchange="onLockChoice(this)">
           <option value=""${effective === "" ? " selected" : ""}>不锁定</option>
           <option value="1"${effective === "1" ? " selected" : ""}>训练集（组1）</option>
           <option value="2"${effective === "2" ? " selected" : ""}>评估集（组2）</option>
@@ -193,20 +209,47 @@ function renderLocks() {
   $("lockTable").querySelector("tbody").innerHTML = rows;
 }
 
+/* 记录未保存的选择。草稿绑定病例表，换表后旧选择不会迁移到同号新患者。 */
+function onLockChoice(select) {
+  if (!currentState) return;
+  const tableId = currentState.case_table_id;
+  if (select.dataset.lockTable !== tableId) return;  // 旧 DOM，忽略
+  lockDraft = LockState.recordChoice(
+    lockDraft, tableId, select.dataset.lockCase, select.value);
+}
+
 async function saveLocks() {
-  const locks = [];
+  if (!currentState) return;
+  const tableId = currentState.case_table_id;
+  const domRows = [];
   document.querySelectorAll("[data-lock-case]").forEach((sel) => {
-    if (sel.value !== "") locks.push({ case_id: sel.dataset.lockCase, group: Number(sel.value) });
+    domRows.push({
+      case_id: sel.dataset.lockCase,
+      patient_id: sel.dataset.lockPatient,
+      value: sel.value,
+      table_id: sel.dataset.lockTable,
+    });
   });
+  const payload = LockState.collectPayload(
+    tableId, domRows, currentState.input.locks, lockDraft);
   try {
     const r = await api("/api/locks", {
       method: "PUT",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ locks }),
+      // 携带保存所依据的病例表指纹，服务端据此拒绝过期表的提交
+      body: JSON.stringify(payload),
     });
+    lockDraft = LockState.newDraft(r.case_table_id);
     setMsg("lockMsg", `锁定已保存（${r.lock_count} 项），新版本 v${r.dataset_version}`, true);
     await refreshAll();
-  } catch (err) { setMsg("lockMsg", err.message); }
+  } catch (err) {
+    setMsg("lockMsg", err.message);
+    if (/病例表/.test(err.message)) {
+      // 换表了：丢弃草稿并立即拉取新表
+      lockDraft = null;
+      await refreshAll();
+    }
+  }
 }
 
 // --------------------------------------------------------------------------- //
@@ -222,6 +265,7 @@ async function runSolve() {
     lastPreview = {
       token: r.preview_token,
       version: r.dataset_version,
+      caseTableId: r.case_table_id,
       result: r.result,
       input: r.input_snapshot,
     };
@@ -274,20 +318,26 @@ function renderAssignments() {
   if (!lastPreview || lastPreview.result.status !== "sat") return;
   const grpFilter = $("filterGroup").value;
   const labFilter = $("filterLabel").value;
-  const locks = lastPreview.input.locks || {};
+  const locks = lastPreview.input.locks || [];
+  const lockByCase = {};
+  for (const item of locks) lockByCase[item.case_id] = item;
   const assigns = lastPreview.result.assignments;
   const rows = lastPreview.input.cases
     .filter((c) => (!grpFilter || String(assigns[c.case_id]) === grpFilter) &&
       (!labFilter || String(c.label) === labFilter))
     .map((c) => {
       const g = assigns[c.case_id];
+      const lock = lockByCase[c.case_id];
+      const lockText = lock && lock.patient_id === c.patient_id
+        ? "是 → " + (lock.group === 1 ? "训练集" : "评估集")
+        : "否";
       return `<tr>
         <td>${escapeHtml(c.case_id)}</td>
         <td>${escapeHtml(c.patient_id)}</td>
         <td>${c.label}</td>
         <td>${g}</td>
         <td>${g === 1 ? "训练集" : "评估集"}</td>
-        <td>${c.case_id in locks ? "是 → " + (locks[c.case_id] === 1 ? "训练集" : "评估集") : "否"}</td>
+        <td>${lockText}</td>
       </tr>`;
     }).join("");
   $("assignTable").querySelector("tbody").innerHTML = rows;
@@ -393,11 +443,24 @@ async function loadVersionLog() {
 async function refreshAll(showStaleBanner = false) {
   try {
     const prevVersion = currentVersion;
+    const prevTableId = currentTableId;
     currentState = await api("/api/state");
     renderState();
     $("healthBadge").textContent = "已连接";
     $("healthBadge").className = "badge";
+    const tableChanged = prevTableId !== null &&
+      prevTableId !== currentState.case_table_id;
     const changed = prevVersion !== null && prevVersion !== currentState.dataset_version;
+    if (tableChanged) {
+      // 换表：旧预览、锁定草稿全部作废，原患者未保存的选择不得出现在新患者行
+      lockDraft = null;
+      lastPreview = null;
+      $("satBox").classList.add("hidden");
+      $("unsatBox").classList.add("hidden");
+      $("solveStatus").textContent = "病例表已更换，请重新核对锁定并重新求解。";
+      $("solveStatus").className = "msg err";
+      setMsg("lockMsg", "病例表已更换：仅病例号与患者号均相同的锁定被保留，请重新核对。");
+    }
     if (changed || showStaleBanner) {
       $("staleBanner").classList.toggle("hidden", !changed && !showStaleBanner);
       if (lastPreview && lastPreview.version !== currentVersion) {

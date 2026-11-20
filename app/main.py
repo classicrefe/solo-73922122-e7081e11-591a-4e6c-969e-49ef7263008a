@@ -17,7 +17,9 @@ from pydantic import BaseModel, Field
 from .db import Database, StaleVersionError
 from .models import (
     ActiveInput,
+    StaleCaseTableError,
     ValidationError,
+    case_table_id,
     parse_cases_csv,
     parse_relatives_csv,
     validate_locks,
@@ -84,7 +86,9 @@ class QuotasPayload(BaseModel):
 
 
 class LocksPayload(BaseModel):
-    locks: list  # [{"case_id": str, "group": 1|2}, ...]
+    locks: list  # [{"case_id": str, "patient_id": str, "group": 1|2}, ...]
+    # 保存锁定所依据的病例表指纹；缺省时退化为“按当前病例表”保存（兼容旧客户端）
+    case_table_id: str | None = None
 
 
 class PublishPayload(BaseModel):
@@ -109,6 +113,14 @@ async def _stale_handler(_request, exc: StaleVersionError):
     return JSONResponse(status_code=409, content={"detail": str(exc)})
 
 
+@app.exception_handler(StaleCaseTableError)
+async def _stale_case_table_handler(_request, exc: StaleCaseTableError):
+    return JSONResponse(
+        status_code=409,
+        content={"detail": str(exc), "code": "STALE_CASE_TABLE"},
+    )
+
+
 # --------------------------------------------------------------------------- #
 # 状态与上传
 # --------------------------------------------------------------------------- #
@@ -125,6 +137,8 @@ def get_state():
         label_totals[c.label] += 1
     return {
         "dataset_version": version,
+        "case_table_epoch": active.case_table_epoch,
+        "case_table_id": active.case_table_id(),
         "label_totals": label_totals,
         "patient_count": len({c.patient_id for c in active.cases}),
         "input": active.to_json(),
@@ -146,9 +160,28 @@ async def upload_cases(file: UploadFile = File(...)):
     raw = await _read_upload(file)
     # 解析/校验全部完成且无异常后才写库；失败不触碰源数据
     cases = parse_cases_csv(raw)
+    _, before = db.get_state()
+    dropped = sorted(
+        cid for cid, lock in before.locks.items()
+        if {c.case_id: c.patient_id for c in cases}.get(cid) != lock.patient_id
+    )
     new_version = db.replace_cases(cases)
-    return {"dataset_version": new_version, "case_count": len(cases),
-            "notice": "病例已替换；亲属关系与指向已删除病例的锁定已清空，需要时请重新设置。"}
+    _, active = db.get_state()
+    notice = (
+        "病例已替换；亲属关系已清空，需要时请重新上传。"
+        f"锁定仅保留病例号与患者号均相同的 {len(active.locks)} 项"
+        "（病例号改指其他患者或已删除的锁定不会跟随迁移）"
+        + (f"，本次丢弃 {len(dropped)} 项：{', '.join(dropped)}。" if dropped else "。")
+    )
+    return {
+        "dataset_version": new_version,
+        "case_count": len(cases),
+        "case_table_id": case_table_id(cases),
+        "case_table_epoch": active.case_table_epoch,
+        "kept_lock_count": len(active.locks),
+        "dropped_locks": dropped,
+        "notice": notice,
+    }
 
 
 @app.post("/api/upload/relatives")
@@ -176,9 +209,28 @@ def update_quotas(payload: QuotasPayload):
 @app.put("/api/locks")
 def update_locks(payload: LocksPayload):
     _, active = db.get_state()
-    locks = validate_locks(payload.locks, [c.case_id for c in active.cases])
-    new_version = db.update_locks(locks)
-    return {"dataset_version": new_version, "lock_count": len(locks)}
+    if not active.cases:
+        raise ValidationError(["还没有病例数据，请先上传病例 CSV 再保存锁定。"])
+    current_table_id = active.case_table_id()
+    # 0) 整次提交所依据的病例表必须先核对：旧表提交一律整次拒绝
+    if payload.case_table_id and payload.case_table_id != current_table_id:
+        raise StaleCaseTableError(
+            "锁定提交所依据的病例表已被替换"
+            f"（提交依据 {payload.case_table_id[:8]}…，"
+            f"当前病例表 {current_table_id[:8]}…）。整次提交已拒绝，"
+            "现行锁定、输入版本与已发布清单均未改动；"
+            "请刷新页面、重新核对新病例表后再保存锁定。"
+        )
+    # 1) 逐条核对：病例号必须存在，且患者号必须与当前病例表一致
+    locks = validate_locks(payload.locks, active.cases)
+    # 2) db 内在同一事务中再次核对病例表，堵住“核对后、写入前”的换表窗口
+    new_version = db.update_locks(locks, case_table_id=current_table_id)
+    return {
+        "dataset_version": new_version,
+        "lock_count": len(locks),
+        "case_table_id": current_table_id,
+        "locks": [lock.to_json() for cid, lock in sorted(locks.items())],
+    }
 
 
 # --------------------------------------------------------------------------- #
@@ -192,7 +244,7 @@ def solve():
         raise ValidationError(["还没有病例数据，请先上传病例 CSV。"])
     input_snapshot = active.to_json()
     result = solve_split(
-        active.cases, active.relatives, active.quotas, active.locks
+        active.cases, active.relatives, active.quotas, active.lock_groups()
     )
     # 计算结束后复核版本：若期间输入被改动，本次结果对应旧版本，拒绝生成预览
     current_version = db.get_version()
@@ -209,6 +261,7 @@ def solve():
         token = _add_preview(version, input_snapshot, result)
     return {
         "dataset_version": version,
+        "case_table_id": active.case_table_id(),
         "preview_token": token,
         "result": result,
         "input_snapshot": input_snapshot,
@@ -257,12 +310,15 @@ def manifest_download(manifest_id: str):
         )
     result = manifest["result"]
     assignments = result["assignments"]
-    locks = manifest["input"].get("locks", {})
+    locks = manifest["input"].get("locks", [])
+    if isinstance(locks, dict):  # 兼容历史清单的旧存储格式
+        locks = [{"case_id": cid} for cid in locks]
+    locked_cases = {item["case_id"] for item in locks if isinstance(item, dict)}
     lines = ["病例号,患者号,标签,分组编号,分组名称,是否锁定"]
     for c in manifest["input"]["cases"]:
         cid = c["case_id"]
         grp = assignments[cid]
-        locked = "是" if cid in locks else "否"
+        locked = "是" if cid in locked_cases else "否"
         lines.append(
             f"{cid},{c['patient_id']},{c['label']},{grp},"
             f"{'训练集' if grp == 1 else '评估集'},{locked}"
